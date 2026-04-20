@@ -1,0 +1,9 @@
+# pykrx는 scripts/lib에 내장 (KRX 로그인 정책 대응 수정 버전)
+pandas>=2.0.0
+numpy>=1.24.0
+bs4
+requests
+supabase
+deprecated>=1.2.14
+multipledispatch>=1.0.0
+matplotlib>=3.8.0
