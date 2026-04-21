@@ -86,7 +86,7 @@ def fetch_naver_net_buyers(market_code, investor_code, trade_type='buy', sort_by
 def fetch_foreign_hold(market_code):
     url = f"https://finance.naver.com/sise/sise_foreign_hold.naver?sosok={market_code}"
     try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         res.encoding = 'euc-kr'
         soup = BeautifulSoup(res.text, 'html.parser')
         rows = soup.select("table.type_2 tr")
@@ -106,7 +106,7 @@ def fetch_foreign_hold(market_code):
 def fetch_pension_from_judal(trade_type):
     url = f"https://www.judal.co.kr/?view=stockList&type=fund{'Buy' if trade_type=='buy' else 'Sell'}"
     try:
-        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         soup = BeautifulSoup(res.content, 'html.parser')
         rows = soup.find('table').find_all('tr')[1:]
         kospi, kosdaq = [], []
@@ -140,38 +140,172 @@ def get_current_price_change(ticker):
 # --- 거래량 데이터(Volume) 수집 로직 ---
 
 def fetch_naver_sise_list(url):
-    menu = 'quant_high' if 'quant_high' in url else ('quant_low' if 'quant_low' in url else 'quant')
-    payload = {'menu': menu, 'returnUrl': url, 'fieldIds': ['amount', 'prev_quant', 'quant', 'ask_buy', 'ask_sell']}
+    """
+    네이버 금융 시세 리스트(거래량 상위, 급증, 급락 등)를 수집합니다.
+    헤더 텍스트를 기반으로 컬럼을 동적으로 매핑하여 견고한 파싱을 보장합니다.
+    """
+    if 'quant_high' in url:
+        menu = 'quant_high'
+    elif 'quant_low' in url:
+        menu = 'quant_low'
+    else:
+        menu = 'quant'
+        
+    submit_url = "https://finance.naver.com/sise/field_submit.naver"
+    payload = {
+        'menu': menu,
+        'returnUrl': url,
+        'fieldIds': ['quant', 'amount', 'prev_quant', 'ask_buy', 'ask_sell', 'frgn_rate']
+    }
+
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+    
     try:
-        res = requests.post("https://finance.naver.com/sise/field_submit.naver", data=payload, headers={'User-Agent': 'Mozilla/5.0'})
+        session = requests.Session()
+        res = session.post(submit_url, data=payload, headers=headers, timeout=10)
+        res.raise_for_status()
+        
+        # Naver Finance는 EUC-KR/CP949 인코딩을 사용합니다.
         res.encoding = 'cp949'
+        
         soup = BeautifulSoup(res.text, 'html.parser')
         table = soup.select_one("table.type_2")
         if not table: return []
+            
+        headers_tags = table.find_all("th")
+        if not headers_tags: return []
+        
+        headers_text = [h.text.strip() for h in headers_tags]
+        
+        def find_idx(name_list):
+            # 1단계: 정확히 일치하는 헤더 검색
+            for name in name_list:
+                for i, h in enumerate(headers_text):
+                    if name == h: return i
+            # 2단계: 부분 일치 헤더 검색
+            for name in name_list:
+                for i, h in enumerate(headers_text):
+                    # '거래량' 검색 시 '전일거래량'이 먼저 잡히지 않도록 예외 처리
+                    if name == '거래량' and '전일' in h: continue
+                    if name in h: return i
+            return -1
+
+        idx_map = {
+            "name": find_idx(["종목명"]),
+            "price": find_idx(["현재가"]),
+            "change": find_idx(["전일비"]),
+            "rate": find_idx(["등락률"]),
+            "volume": find_idx(["거래량"]),
+            "amount": find_idx(["거래대금"]),
+            "prev_vol": find_idx(["전일거래량", "이전거래량"]),
+            "buy": find_idx(["매수호가"]),
+            "sell": find_idx(["매도호가"])
+        }
+        
+        is_surge_plunge = "high" in url or "low" in url
+        
+        # Fallback indices if header parsing fails (updated for 2026-04-21 with fieldIds)
+        if is_surge_plunge:
+            # ['N', '증가율', '종목명', '현재가', '전일비', '등락률', '거래량', '거래대금', '전일거래량', '매수호가', '매도호가']
+            default_map = {"name": 2, "price": 3, "change": 4, "rate": 5, "volume": 6, "amount": 7, "prev_vol": 8, "buy": 9, "sell": 10}
+        else:
+            # ['N', '종목명', '현재가', '전일비', '등락률', '거래량', '거래대금', '전일거래량', '매수호가', '매도호가']
+            default_map = {"name": 1, "price": 2, "change": 3, "rate": 4, "volume": 5, "amount": 6, "prev_vol": 7, "buy": 8, "sell": 9}
+            
+        for key, def_val in default_map.items():
+            if idx_map[key] == -1: idx_map[key] = def_val
+        
         rows = table.find_all("tr")
         results = []
-        # Index mapping simplified (Production should use the robust find_idx from original)
         for r in rows:
+            if 'class' in r.attrs and 'line' in r.attrs['class']: continue
             cols = r.find_all("td")
             if len(cols) < 5 or not cols[0].text.strip().isdigit(): continue
-            name_tag = cols[1].find("a") if not ("high" in url or "low" in url) else cols[2].find("a")
-            if not name_tag: continue
             
-            # (Detailed parsing logic omitted for brevity in bridge, 
-            # ideally we port the exact logic from fetch_volume_data.py)
-            price = safe_int(cols[2 if not ("high" in url or "low" in url) else 3].text.strip().replace(",", ""))
-            change_rate = to_json_float(cols[4 if not ("high" in url or "low" in url) else 5].text.strip().replace("%", ""))
-            
-            results.append({
-                "no": cols[0].text.strip(),
-                "ticker": name_tag.get("href", "").split("code=")[-1],
-                "name": name_tag.text.strip(),
-                "price": price,
-                "changeRate": change_rate,
-                "volume": safe_int(cols[5 if not ("high" in url or "low" in url) else 8].text.strip().replace(",", "")),
-                "amount": safe_int(cols[10 if not ("high" in url or "low" in url) else 10].text.strip().replace(",", "")) * 1000000,
-                "market": "KOSPI" if "sosok=0" in url else "KOSDAQ"
-            })
+            try:
+                name_td = cols[idx_map["name"]]
+                name_tag = name_td.find("a")
+                if not name_tag: continue
+                
+                name = name_tag.text.strip()
+                ticker = name_tag.get("href", "").split("code=")[-1]
+                
+                def get_val(key):
+                    i = idx_map.get(key, -1)
+                    if i == -1 or i >= len(cols): return "0"
+                    return cols[i].text.strip().replace(",", "").replace("%", "")
+
+                price = safe_int(get_val("price"))
+                change_val = safe_int(get_val("change"))
+                change_td = cols[idx_map["change"]]
+                
+                # 가려진 텍스트(blind)나 em 클래스에서 부호 찾기
+                blind_span = change_td.select_one("span.blind")
+                blind_text = blind_span.text.strip() if blind_span else ""
+                
+                # 클래스 기반 부호 판별 (nv01: 하락, red02: 상승)
+                num_span = change_td.select_one("span.tah")
+                span_class = "".join(num_span.get("class", [])) if num_span else ""
+                
+                # em 태그 클래스 확인 (bu_pdn: 하락, bu_pup: 상승)
+                em_tag = change_td.find("em")
+                em_class = "".join(em_tag.get("class", [])) if em_tag else ""
+                
+                # 부호 결정 우선순위: blind 텍스트 > 클래스
+                if "하락" in blind_text or "하한" in blind_text or "nv01" in span_class or "bu_pdn" in em_class:
+                    change_val = -abs(change_val)
+                elif "상승" in blind_text or "상한" in blind_text or "red02" in span_class or "bu_pup" in em_class:
+                    change_val = abs(change_val)
+                # 아이콘(img) 태그도 여전히 체크 (예외 대비)
+                else:
+                    ico = change_td.find("img")
+                    if ico:
+                        alt = ico.get("alt", "")
+                        if "하락" in alt or "하한" in alt: 
+                            change_val = -abs(change_val)
+                        elif "상승" in alt or "상한" in alt: 
+                            change_val = abs(change_val)
+                    
+                rate = to_json_float(get_val("rate"))
+                # change_val의 부호에 따라 rate의 부호도 맞춤
+                if change_val < 0:
+                    rate = -abs(rate)
+                elif change_val > 0:
+                    rate = abs(rate)
+                # 아이콘/클래스를 못찾은 경우를 대비해 rate 부호로 역추적
+                elif rate < 0:
+                    change_val = -abs(change_val)
+                elif rate > 0:
+                    change_val = abs(change_val)
+                
+                volume = safe_int(get_val("volume"))
+                raw_amount = safe_int(get_val("amount"))
+                amount = raw_amount * 1000000 
+                
+                # Fallback for amount if column missing but volume exists
+                if amount == 0 and volume > 0 and price > 0:
+                    amount = price * volume
+                
+                prev_volume = safe_int(get_val("prev_vol"))
+                buy_quote = safe_int(get_val("buy"))
+                sell_quote = safe_int(get_val("sell"))
+                
+                results.append({
+                    "no": cols[0].text.strip(),
+                    "ticker": ticker,
+                    "name": name,
+                    "price": price,
+                    "change": change_val,
+                    "changeRate": rate,
+                    "volume": volume,
+                    "prevVolume": prev_volume,
+                    "amount": amount,
+                    "buyQuote": buy_quote,
+                    "sellQuote": sell_quote,
+                    "market": "KOSPI" if "sosok=0" in url else "KOSDAQ"
+                })
+            except: continue
+        print(f"  Successfully fetched {len(results)} items from {url}")
         return results
     except Exception as e:
         print(f"Error fetching {url}: {e}")
@@ -195,12 +329,22 @@ def collect_main_data():
     hold_kospi = fetch_foreign_hold('0')
     hold_kosdaq = fetch_foreign_hold('1')
 
-    # Update prices for essential lists
-    for data_list in [inst_kospi["buy"], inst_kospi["sell"], for_kospi["buy"], for_kospi["sell"], ind_kospi["buy"], ind_kospi["sell"]]:
+    # Update prices and market tags for all lists
+    updates = [
+        (inst_kospi["buy"], 'KOSPI'), (inst_kospi["sell"], 'KOSPI'),
+        (inst_kosdaq["buy"], 'KOSDAQ'), (inst_kosdaq["sell"], 'KOSDAQ'),
+        (for_kospi["buy"], 'KOSPI'), (for_kospi["sell"], 'KOSPI'),
+        (for_kosdaq["buy"], 'KOSDAQ'), (for_kosdaq["sell"], 'KOSDAQ'),
+        (ind_kospi["buy"], 'KOSPI'), (ind_kospi["sell"], 'KOSPI'),
+        (ind_kosdaq["buy"], 'KOSDAQ'), (ind_kosdaq["sell"], 'KOSDAQ'),
+        (hold_kospi, 'KOSPI'), (hold_kosdaq, 'KOSDAQ')
+    ]
+    
+    for data_list, market_name in updates:
         for item in data_list:
             item['price'], item['changeRate'] = get_current_price_change(item['ticker'])
-            item['market'] = 'KOSPI'
-            time.sleep(0.1)
+            item['market'] = market_name
+            time.sleep(0.05)
 
     return {
         "baseDate": today.strftime("%Y-%m-%d"),
@@ -214,9 +358,18 @@ def collect_main_data():
 
 def collect_volume_data():
     today = get_market_date()
+    
+    top_vol_kospi = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant.naver?sosok=0")
+    top_vol_kosdaq = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant.naver?sosok=1")
+    
+    # Validation: If both markets' Top Volume is empty, something is wrong.
+    if not top_vol_kospi and not top_vol_kosdaq:
+        print("CRITICAL: Scraped empty data for both KOSPI and KOSDAQ. Skipping this update.")
+        return None
+
     return {
         "baseDate": today.strftime("%Y-%m-%d"),
-        "topVolume": {"KOSPI": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant.naver?sosok=0"), "KOSDAQ": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant.naver?sosok=1")},
+        "topVolume": {"KOSPI": top_vol_kospi, "KOSDAQ": top_vol_kosdaq},
         "volumeSurge": {"KOSPI": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_high.naver?sosok=0"), "KOSDAQ": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_high.naver?sosok=1")},
         "volumePlunge": {"KOSPI": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_low.naver?sosok=0"), "KOSDAQ": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_low.naver?sosok=1")},
         "volumeUpdatedAt": datetime.now(timezone(timedelta(hours=9))).isoformat()
@@ -227,6 +380,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--type', choices=['main', 'volume'], required=True)
     args = parser.parse_args()
+
+    # Load from .env.local if exists (for local testing)
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.local")
+    if os.path.exists(env_path):
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if '=' in line:
+                    k, v = line.strip().split('=', 1)
+                    if k.startswith("NEXT_PUBLIC_"):
+                        # Map NEXT_PUBLIC_SUPABASE_URL to SUPABASE_URL if needed
+                        new_k = k.replace("NEXT_PUBLIC_", "")
+                        if new_k not in os.environ: os.environ[new_k] = v
+                    if k not in os.environ: os.environ[k] = v
 
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_ANON_KEY")
@@ -244,6 +410,10 @@ def main():
     else:
         print("Collecting Volume Data...")
         data = collect_volume_data()
+
+    if data is None:
+        print(f"Skipping Supabase update for {args.type} due to missing data.")
+        sys.exit(0)
 
     # Supabase Upsert
     try:
