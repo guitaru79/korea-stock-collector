@@ -9,12 +9,7 @@ from datetime import datetime, timedelta, timezone
 import math
 from supabase import create_client, Client
 
-# 프로젝트 내장 pykrx 라이브러리를 우선 참조
-_lib_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib")
-sys.path.insert(0, _lib_dir)
-
-import pandas as pd
-from pykrx import stock
+# 실시간 조회를 위해 네이버 폴링 API 사용
 
 # --- 전역 유틸리티 함수 ---
 
@@ -128,14 +123,42 @@ def fetch_pension_from_judal(trade_type):
         return {"KOSPI": kospi, "KOSDAQ": kosdaq}
     except: return {"KOSPI": [], "KOSDAQ": []}
 
-def get_current_price_change(ticker):
-    try:
-        ohlcv = stock.get_market_ohlcv((datetime.today() - timedelta(days=7)).strftime("%Y%m%d"), datetime.today().strftime("%Y%m%d"), ticker)
-        if not ohlcv.empty:
-            last = ohlcv.iloc[-1]
-            return int(last['종가']), to_json_float(last['등락률'])
-    except: pass
-    return 0, 0.0
+def fetch_realtime_prices(tickers):
+    """네이버 폴링 API를 사용하여 실시간 현재가와 등락률을 일괄 조회"""
+    results = {}
+    if not tickers: return results
+    
+    batch_size = 50
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i+batch_size]
+        query = ",".join(batch)
+        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{query}"
+        try:
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
+            data = res.json()
+            if data.get('resultCode') == 'success':
+                areas = data.get('result', {}).get('areas', [])
+                if areas and len(areas) > 0:
+                    datas = areas[0].get('datas', [])
+                    for item in datas:
+                        ticker = item.get('cd')
+                        price = item.get('nv', 0)
+                        rate = float(item.get('cr', 0.0))
+                        sv = item.get('sv', 0)
+                        
+                        # 부호 판별: 현재가(nv)가 전일종가(sv)보다 작으면 음수 처리
+                        if price < sv:
+                            rate = -abs(rate)
+                        elif price > sv:
+                            rate = abs(rate)
+                        else:
+                            rate = 0.0
+                            
+                        results[ticker] = (price, rate)
+        except Exception as e:
+            print(f"Error fetching realtime prices: {e}")
+        time.sleep(0.1)
+    return results
 
 # --- 거래량 데이터(Volume) 수집 로직 ---
 
@@ -337,14 +360,28 @@ def collect_main_data():
         (for_kosdaq["buy"], 'KOSDAQ'), (for_kosdaq["sell"], 'KOSDAQ'),
         (ind_kospi["buy"], 'KOSPI'), (ind_kospi["sell"], 'KOSPI'),
         (ind_kosdaq["buy"], 'KOSDAQ'), (ind_kosdaq["sell"], 'KOSDAQ'),
+        (pen_buy["KOSPI"], 'KOSPI'), (pen_sell["KOSPI"], 'KOSPI'),
+        (pen_buy["KOSDAQ"], 'KOSDAQ'), (pen_sell["KOSDAQ"], 'KOSDAQ'),
         (hold_kospi, 'KOSPI'), (hold_kosdaq, 'KOSDAQ')
     ]
     
+    # 1. 수집된 모든 고유 티커 추출
+    all_tickers = set()
+    for data_list, _ in updates:
+        for item in data_list:
+            all_tickers.add(item['ticker'])
+            
+    # 2. 네이버 폴링 API를 통해 실시간 주가 일괄 조회
+    print(f"Fetching realtime prices for {len(all_tickers)} tickers...")
+    realtime_prices = fetch_realtime_prices(list(all_tickers))
+    
+    # 3. 각 항목의 주가와 등락률을 실시간 데이터로 업데이트
     for data_list, market_name in updates:
         for item in data_list:
-            item['price'], item['changeRate'] = get_current_price_change(item['ticker'])
+            ticker = item['ticker']
+            if ticker in realtime_prices:
+                item['price'], item['changeRate'] = realtime_prices[ticker]
             item['market'] = market_name
-            time.sleep(0.05)
 
     return {
         "baseDate": today.strftime("%Y-%m-%d"),
