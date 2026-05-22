@@ -124,40 +124,65 @@ def fetch_pension_from_judal(trade_type):
     except: return {"KOSPI": [], "KOSDAQ": []}
 
 def fetch_realtime_prices(tickers):
-    """네이버 폴링 API를 사용하여 실시간 현재가와 등락률을 일괄 조회"""
+    """
+    네이버 증권의 실시간 폴링 API를 사용하여 주가와 등락률을 벌크로 가져옵니다.
+    장 마감 후에는 시간외 단일가(nxtOverMarketPriceInfo)를 우선적으로 반영합니다.
+    """
+    if not tickers:
+        return {}
+        
     results = {}
-    if not tickers: return results
-    
-    batch_size = 50
+    batch_size = 10
     for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
-        query = ",".join(batch)
-        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{query}"
+        batch = tickers[i:i + batch_size]
+        url = f"https://polling.finance.naver.com/api/realtime?query=SERVICE_ITEM:{','.join(batch)}"
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://finance.naver.com/",
+            "Accept": "*/*",
+            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
         try:
-            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
-            data = res.json()
-            if data.get('resultCode') == 'success':
-                areas = data.get('result', {}).get('areas', [])
-                if areas and len(areas) > 0:
-                    datas = areas[0].get('datas', [])
-                    for item in datas:
-                        ticker = item.get('cd')
-                        price = item.get('nv', 0)
-                        rate = float(item.get('cr', 0.0))
-                        sv = item.get('sv', 0)
-                        
-                        # 부호 판별: 현재가(nv)가 전일종가(sv)보다 작으면 음수 처리
-                        if price < sv:
-                            rate = -abs(rate)
-                        elif price > sv:
-                            rate = abs(rate)
-                        else:
-                            rate = 0.0
-                            
-                        results[ticker] = (price, rate)
+            resp = requests.get(url, headers=headers, timeout=10)
+            data = resp.json()
+            
+            items = data.get('result', {}).get('areas', [{}])[0].get('datas', [])
+            for item in items:
+                ticker = item.get('cd')
+                if ticker:
+                    # 기본 시세 (장중)
+                    price = item.get('nv', 0)
+                    rate = float(item.get('cr', 0.0))
+                    sv = item.get('sv', 0) # 전일 종가
+                    
+                    # 부호 보정 (polling API의 cr은 절대값인 경우가 있음)
+                    if price < sv:
+                        rate = -abs(rate)
+                    elif price > sv:
+                        rate = abs(rate)
+                    
+                    
+                    nxt = item.get('nxtOverMarketPriceInfo')
+                    if nxt:
+                        # 'overPrice' (현재가), 'fluctuationsRatio' (등락률), 'compareToPreviousClosePrice' (전일비)
+                        nxt_price_str = nxt.get('overPrice')
+                        if nxt_price_str:
+                            try:
+                                price = int(nxt_price_str.replace(',', ''))
+                                # 시간외 등락률 및 전일비 업데이트
+                                rate_str = nxt.get('fluctuationsRatio', '0')
+                                rate = float(rate_str)
+                                
+                                cv_str = nxt.get('compareToPreviousClosePrice', '0')
+                                cv = int(cv_str.replace(',', ''))
+                            except (ValueError, TypeError):
+                                pass
+                    
+                    results[ticker] = (price, rate, sv)
         except Exception as e:
-            print(f"Error fetching realtime prices: {e}")
-        time.sleep(0.1)
+            print(f"Error fetching realtime prices for batch {i}: {e}")
+            
     return results
 
 # --- 거래량 데이터(Volume) 수집 로직 ---
@@ -181,7 +206,14 @@ def fetch_naver_sise_list(url):
         'fieldIds': ['quant', 'amount', 'prev_quant', 'ask_buy', 'ask_sell', 'frgn_rate']
     }
 
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'}
+    headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://finance.naver.com/",
+    "Accept": "*/*",
+    "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
+}
     
     try:
         session = requests.Session()
@@ -336,6 +368,31 @@ def fetch_naver_sise_list(url):
 
 # --- 실행 로직 ---
 
+def update_list_with_realtime_prices(data_lists, market_name=None):
+    """모든 데이터 리스트의 티커를 수집하여 네이버 폴링 API로 실시간 주가를 반영합니다."""
+    all_tickers = set()
+    for dl in data_lists:
+        for item in dl:
+            if 'ticker' in item:
+                all_tickers.add(item['ticker'])
+    
+    if not all_tickers:
+        return
+
+    print(f"Updating realtime prices for {len(all_tickers)} tickers...")
+    realtime_data = fetch_realtime_prices(list(all_tickers))
+    
+    for dl in data_lists:
+        for item in dl:
+            ticker = item.get('ticker')
+            if ticker in realtime_data:
+                price, rate, sv = realtime_data[ticker]
+                item['price'] = price
+                item['changeRate'] = rate
+                item['prevPrice'] = sv
+            if market_name:
+                item['market'] = market_name
+
 def collect_main_data():
     today = get_market_date()
     # Scrape each group
@@ -352,36 +409,9 @@ def collect_main_data():
     hold_kospi = fetch_foreign_hold('0')
     hold_kosdaq = fetch_foreign_hold('1')
 
-    # Update prices and market tags for all lists
-    updates = [
-        (inst_kospi["buy"], 'KOSPI'), (inst_kospi["sell"], 'KOSPI'),
-        (inst_kosdaq["buy"], 'KOSDAQ'), (inst_kosdaq["sell"], 'KOSDAQ'),
-        (for_kospi["buy"], 'KOSPI'), (for_kospi["sell"], 'KOSPI'),
-        (for_kosdaq["buy"], 'KOSDAQ'), (for_kosdaq["sell"], 'KOSDAQ'),
-        (ind_kospi["buy"], 'KOSPI'), (ind_kospi["sell"], 'KOSPI'),
-        (ind_kosdaq["buy"], 'KOSDAQ'), (ind_kosdaq["sell"], 'KOSDAQ'),
-        (pen_buy["KOSPI"], 'KOSPI'), (pen_sell["KOSPI"], 'KOSPI'),
-        (pen_buy["KOSDAQ"], 'KOSDAQ'), (pen_sell["KOSDAQ"], 'KOSDAQ'),
-        (hold_kospi, 'KOSPI'), (hold_kosdaq, 'KOSDAQ')
-    ]
-    
-    # 1. 수집된 모든 고유 티커 추출
-    all_tickers = set()
-    for data_list, _ in updates:
-        for item in data_list:
-            all_tickers.add(item['ticker'])
-            
-    # 2. 네이버 폴링 API를 통해 실시간 주가 일괄 조회
-    print(f"Fetching realtime prices for {len(all_tickers)} tickers...")
-    realtime_prices = fetch_realtime_prices(list(all_tickers))
-    
-    # 3. 각 항목의 주가와 등락률을 실시간 데이터로 업데이트
-    for data_list, market_name in updates:
-        for item in data_list:
-            ticker = item['ticker']
-            if ticker in realtime_prices:
-                item['price'], item['changeRate'] = realtime_prices[ticker]
-            item['market'] = market_name
+    # Realtime price updates
+    update_list_with_realtime_prices([inst_kospi["buy"], inst_kospi["sell"], ind_kospi["buy"], ind_kospi["sell"], for_kospi["buy"], for_kospi["sell"], pen_kospi["buy"], pen_kospi["sell"], hold_kospi], 'KOSPI')
+    update_list_with_realtime_prices([inst_kosdaq["buy"], inst_kosdaq["sell"], ind_kosdaq["buy"], ind_kosdaq["sell"], for_kosdaq["buy"], for_kosdaq["sell"], pen_kosdaq["buy"], pen_kosdaq["sell"], hold_kosdaq], 'KOSDAQ')
 
     return {
         "baseDate": today.strftime("%Y-%m-%d"),
@@ -393,22 +423,30 @@ def collect_main_data():
         "updatedAt": datetime.now(timezone(timedelta(hours=9))).isoformat()
     }
 
+
 def collect_volume_data():
     today = get_market_date()
     
     top_vol_kospi = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant.naver?sosok=0")
     top_vol_kosdaq = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant.naver?sosok=1")
+    surge_kospi = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_high.naver?sosok=0")
+    surge_kosdaq = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_high.naver?sosok=1")
+    plunge_kospi = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_low.naver?sosok=0")
+    plunge_kosdaq = fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_low.naver?sosok=1")
     
-    # Validation: If both markets' Top Volume is empty, something is wrong.
     if not top_vol_kospi and not top_vol_kosdaq:
         print("CRITICAL: Scraped empty data for both KOSPI and KOSDAQ. Skipping this update.")
         return None
 
+    # Realtime price updates for volume sections
+    all_vol_lists = [top_vol_kospi, top_vol_kosdaq, surge_kospi, surge_kosdaq, plunge_kospi, plunge_kosdaq]
+    update_list_with_realtime_prices(all_vol_lists)
+
     return {
         "baseDate": today.strftime("%Y-%m-%d"),
         "topVolume": {"KOSPI": top_vol_kospi, "KOSDAQ": top_vol_kosdaq},
-        "volumeSurge": {"KOSPI": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_high.naver?sosok=0"), "KOSDAQ": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_high.naver?sosok=1")},
-        "volumePlunge": {"KOSPI": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_low.naver?sosok=0"), "KOSDAQ": fetch_naver_sise_list("https://finance.naver.com/sise/sise_quant_low.naver?sosok=1")},
+        "volumeSurge": {"KOSPI": surge_kospi, "KOSDAQ": surge_kosdaq},
+        "volumePlunge": {"KOSPI": plunge_kospi, "KOSDAQ": plunge_kosdaq},
         "volumeUpdatedAt": datetime.now(timezone(timedelta(hours=9))).isoformat()
     }
 
